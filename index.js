@@ -1,4 +1,3 @@
-// index.js
 import express from "express";
 import mammoth from "mammoth";
 import iconv from "iconv-lite";
@@ -6,138 +5,84 @@ import iconv from "iconv-lite";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ===== RTF helpers =====
-
-// Определяем RTF по началу "{\rtf"
-function isRtfBuffer(buf) {
-  const head = buf.slice(0, 5).toString("ascii");
-  return head.startsWith("{\\rtf");
+// ---- helpers: sniff type ----
+function looksLikeRtf(buf) {
+  return buf?.slice(0, 5).toString("ascii") === "{\\rtf";
+}
+function looksLikeDocx(buf) {
+  // zip magic "PK" — DOCX это zip-контейнер
+  return buf?.slice(0, 2).toString("ascii") === "PK";
 }
 
-// Удаляем вложенные группы полностью: fonttbl/colortbl/stylesheet/info/pict/header/footer и любые {\* ...}
-function stripGroups(rtf, ignoreKeys) {
-  const N = rtf.length;
-  let out = "";
-  const stack = []; // [{ignore:boolean}]
-  let i = 0;
-
-  const isLetter = (c) =>
-    (c >= "a" && c <= "z") || (c >= "A" && c <= "Z");
-
-  const groupIgnored = () => stack.some((s) => s.ignore);
-
-  while (i < N) {
-    const ch = rtf[i];
-
-    if (ch === "{") {
-      // выясняем, нужно ли игнорить группу
-      let j = i + 1;
-      let ignore = false;
-
-      if (rtf[j] === "\\") j++;
-
-      if (rtf[j] === "*") {
-        ignore = true; // {\* ...}
-        j++;
-      } else {
-        if (rtf[j] === "\\") j++;
-        let k = j;
-        while (k < N && isLetter(rtf[k])) k++;
-        const cw = rtf.slice(j, k).toLowerCase();
-        if (ignoreKeys.has(cw)) ignore = true;
-      }
-
-      stack.push({ ignore });
-      if (!groupIgnored()) out += "{";
-      i++;
-      continue;
-    }
-
-    if (ch === "}") {
-      const g = stack.pop() || { ignore: false };
-      if (!groupIgnored() && !g.ignore) out += "}";
-      i++;
-      continue;
-    }
-
-    if (!groupIgnored()) out += ch;
-    i++;
-  }
-  return out;
-}
-
-// Конвертация RTF -> текст
-function rtfToText(buf) {
-  // binary-строка, чтобы сохранить \'hh
-  let rtf = buf.toString("binary");
-
-  // кодовая страница
-  const cpMatch = rtf.match(/\\ansicpg(\d+)/);
-  const codepage = cpMatch ? `cp${cpMatch[1]}` : "cp1251";
-
-  // сносим вложенные служебные группы
-  rtf = stripGroups(
-    rtf,
-    new Set([
-      "fonttbl",
-      "colortbl",
-      "stylesheet",
-      "info",
-      "pict",
-      "header",
-      "footer",
-    ])
-  );
-  // и любые {\* ...}
-  rtf = stripGroups(rtf, new Set(["*"]));
-
-  // абзацы/табы
-  rtf = rtf.replace(/\\par[d]?\b/g, "\n").replace(/\\tab\b/g, "\t");
-
-  // hex-эскейпы: \'hh
-  rtf = rtf.replace(/\\'([0-9a-fA-F]{2})/g, (_, h) =>
-    iconv.decode(Buffer.from(h, "hex"), codepage)
-  );
-
-  // вычищаем управляющие слова \b \fs24 \f0 \u-123? и т.п.
-  rtf = rtf.replace(
-    /\\[a-z]+-?\d*(?:\s|(?=[\\{}]))/gi,
-    ""
-  );
-
-  // без скобок и лишних переносов
+// ---- RTF -> plain text ----
+function rtfToText(rtfBuf) {
+  let rtf = rtfBuf.toString("latin1"); // не ломаем байты
+  // 1) вырезаем картинки, вложенные объекты и скрытые группы
   rtf = rtf
-    .replace(/[{}]/g, "")
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+    .replace(/\{\\\*\\[^{}]+?\{[^{}]*\}[^{}]*\}/gs, "") // спец. группы {\*\...{...}...}
+    .replace(/\{\\pict[\s\S]*?\}/gi, "");              // картинки {\pict ...}
 
-  return rtf;
+  // 2) вытащим кодовую страницу, по умолчанию 1252
+  const mCpg = rtf.match(/\\ansicpg(\d{3,4})/i);
+  const cp = mCpg ? `cp${mCpg[1]}` : "cp1252";
+
+  // 3) сначала unicode: \uNNNN?  (RTF: signed 16-bit)
+  rtf = rtf.replace(/\\u(-?\d+)\??/g, (_, u) => {
+    let code = parseInt(u, 10);
+    if (code < 0) code = 65536 + code; // signed -> unsigned
+    return String.fromCharCode(code);
+  });
+
+  // 4) потом байтовые последовательности \'hh -> собрать в Buffer и декодировать в нужной кодировке
+  rtf = rtf.replace(/\\'([0-9a-fA-F]{2})/g, (_, hh) =>
+    iconv.decode(Buffer.from(hh, "hex"), cp)
+  );
+
+  // 5) убрать управляющие слова/экранирования \\, \{, \}
+  rtf = rtf
+    .replace(/\\[a-z]+-?\d* ?/gi, "") // команды \b, \par, \fs20 и т.п.
+    .replace(/\\[\{\}\\]/g, m => m.slice(1)) // \{ \} \\ -> { } \
+    .replace(/[{}]/g, ""); // скобочные группы
+
+  // 6) нормализация пробелов/переводов строк
+  return rtf
+    .replace(/\r\n?/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
 }
 
-// ===== HTTP =====
-
-// Принимаем «сырое» тело любого типа, будем определять формат сами
+// ---- middleware: принимем сырой бинарь (octet-stream, docx, rtf) ----
 app.post(
   "/convert",
-  express.raw({ type: "*/*", limit: "20mb" }),
+  express.raw({
+    type: [
+      "application/octet-stream",
+      "application/rtf",
+      "text/rtf",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ],
+    limit: "20mb",
+  }),
   async (req, res) => {
     try {
-      const buf = Buffer.isBuffer(req.body)
-        ? req.body
-        : Buffer.from(req.body);
+      const buf = Buffer.from(req.body);
 
-      // 1) RTF по сигнатуре
-      if (isRtfBuffer(buf)) {
-        const text = rtfToText(buf);
-        return res.json({ type: "rtf", text });
+      let text = "";
+      if (looksLikeDocx(buf)) {
+        const { value } = await mammoth.extractRawText({ buffer: buf });
+        text = value || "";
+      } else if (looksLikeRtf(buf)) {
+        text = rtfToText(buf);
+      } else {
+        // fallback: попробуем как RTF, часто приходят с generic content-type
+        text = rtfToText(buf);
       }
 
-      // 2) DOCX через mammoth
-      const { value } = await mammoth.extractRawText({ buffer: buf });
-      return res.json({ type: "docx", text: value });
+      // лёгкая пост-очистка
+      text = text.replace(/\u0000/g, "").trim();
+      res.json({ type: looksLikeDocx(buf) ? "docx" : "rtf", text });
     } catch (err) {
-      console.error(err);
       res.status(500).json({ error: String(err) });
     }
   }
