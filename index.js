@@ -53,33 +53,97 @@ function isRtf(buf) {
 }
 
 // Преобразование RTF -> текст с учётом \ansicpgXXXX и \'hh
-function rtfToText(rtfBuf) {
-  // читаем как binary, чтобы не потерять байты для \'hh
-  let rtf = rtfBuf.toString("binary");
+function isRtf(buf) {
+  const head = buf.slice(0, 5).toString("ascii");
+  return head.startsWith("{\\rtf");
+}
 
-  // кодовая страница (часто cp1251)
-  const m = rtf.match(/\\ansicpg(\d+)/);
-  const codepage = m ? `cp${m[1]}` : "cp1251";
+// Walk the RTF and drop whole *nested* groups whose first control word
+// matches one of the ignoreKeys (e.g. "fonttbl", "colortbl", "stylesheet", "*", "pict", "info", "header", "footer")
+function stripGroups(rtf, ignoreKeys) {
+  const N = rtf.length;
+  let out = "";
+  const stack = []; // [{ignore:boolean}]
+  let i = 0;
 
-  // убрать служебные группы
-  rtf = rtf
-    .replace(/\{\\\*[^{}]*\}/g, "")
-    .replace(/\{\\fonttbl[^{}]*\}/g, "")
-    .replace(/\{\\colortbl[^{}]*\}/g, "")
-    .replace(/\{\\stylesheet[^{}]*\}/g, "");
+  const isLetter = c => (c >= "a" && c <= "z") || (c >= "A" && c <= "Z");
 
-  // базовые управлялки
+  while (i < N) {
+    const ch = rtf[i];
+
+    if (ch === "{") {
+      // new group: decide if it's ignorable
+      // lookahead control word right after '{' and optional backslash
+      let j = i + 1;
+      let ignore = false;
+
+      if (rtf[j] === "\\") j++;
+
+      // special destination group: {\* ...}
+      if (rtf[j] === "*") {
+        ignore = true;
+        j++;
+      } else {
+        // read first control word
+        if (rtf[j] === "\\") j++;
+        let k = j;
+        while (k < N && isLetter(rtf[k])) k++;
+        const cw = rtf.slice(j, k).toLowerCase();
+        if (ignoreKeys.has(cw)) ignore = true;
+      }
+
+      stack.push({ ignore });
+      if (!stack.some(s => s.ignore)) out += "{";
+      i++;
+      continue;
+    }
+
+    if (ch === "}") {
+      const g = stack.pop() || { ignore: false };
+      if (!stack.some(s => s.ignore) && !g.ignore) out += "}";
+      i++;
+      continue;
+    }
+
+    // inside pict group we skip everything until its closing '}' (handled by stack)
+    // skipping happens automatically because stack.some(ignore) is true
+
+    // normal char
+    if (!stack.some(s => s.ignore)) out += ch;
+    i++;
+  }
+  return out;
+}
+
+// Basic RTF -> text
+function rtfToText(buf) {
+  // work on a binary string to preserve \'hh
+  let rtf = buf.toString("binary");
+
+  // detect code page
+  const cpMatch = rtf.match(/\\ansicpg(\d+)/);
+  const codepage = cpMatch ? `cp${cpMatch[1]}` : "cp1251";
+
+  // 1) drop nested ignorable groups completely
+  rtf = stripGroups(
+    rtf,
+    new Set(["fonttbl", "colortbl", "stylesheet", "info", "pict", "header", "footer"])
+  );
+  // also drop any {\* …} groups
+  rtf = stripGroups(rtf, new Set(["*"]));
+
+  // 2) paragraph / tabs
   rtf = rtf.replace(/\\par[d]?\b/g, "\n").replace(/\\tab\b/g, "\t");
 
-  // \'hh -> символ нужной кодировки
+  // 3) hex escapes \'hh -> decode with codepage
   rtf = rtf.replace(/\\'([0-9a-fA-F]{2})/g, (_, h) =>
     iconv.decode(Buffer.from(h, "hex"), codepage)
   );
 
-  // убрать прочие управляющие слова (\wordN / \word)
+  // 4) remove remaining control words like \b, \fs24, \f0, \u-123?
   rtf = rtf.replace(/\\[a-z]+-?\d*(?:\s|(?=[\\{}]))/gi, "");
 
-  // убрать группирующие скобки и лишние переводы
+  // 5) strip braces and collapse whitespace
   rtf = rtf
     .replace(/[{}]/g, "")
     .replace(/[ \t]+\n/g, "\n")
@@ -88,3 +152,5 @@ function rtfToText(rtfBuf) {
 
   return rtf;
 }
+
+export { isRtf, rtfToText };
